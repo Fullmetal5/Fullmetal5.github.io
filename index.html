@@ -1,0 +1,168 @@
+<html>
+<head>
+<title>Hacking the Wii Mini</title>
+<link href="core.css" rel="stylesheet" />
+<link href="prism.css" rel="stylesheet" />
+</head>
+<body>
+<script src="prism.js"></script>
+
+<h1>Hacking the Wii Mini</h1>
+<h2>Attack Surface</h2>
+<p>
+The Wii Mini is quite an odd Nintendo device, it was released late in the Wiis life as Nintendo was trying to target cheap gaming. To do this Nintendo had to remove several features of the Wii, among them was the SD card slot as well as the Wifi/Internet connectivity. In doing so Nintendo ended up creating a console that was surprisingly difficult to attack. The attack surface of the Mini consists of:
+</p>
+<ul>
+	<li>Disc Drive</li>
+	<li>USB port</li>
+	<li>Bluetooth</li>
+</ul>
+<p>
+Of those options the first thing that sticks out is the USB port. The disc drive only runs signed content and the signing mechanism has already been audited and had the only major bug likely to exist in it found and fixed. Bluetooth looks kinda interesting but communication is mostly simple data such as control input which doesn't sound promising, there is also some local storage on the Wii remote however very few games actually do anything with it and none looked to be exploitable. I was able to get crashes in some games but they didn't look interesting and were mostly null pointer dereferences and such.
+</p>
+<p>
+After spending a few months auditing the IOS drivers for the usb stack I was only able to find a few infinite loops and buffer over reads but nothing exploitable. After this I turned to games, most games used only the usb port for a simple mic however a few Ubisoft games such as Your Shape used a usb camera. As luck would have it Ubisoft decided to be nice and happened to leave an unstripped elf file on disc for their games. After looking at the camera implementation they named libcam it seemed like nothing was exploitable, the game only accepted hardcoded video sizes and frames were sent uncompressed which eliminating most of the attack surface for the library. I was able to find a few size fields that weren't checked however, these sizes were used to allocate things from the heap and the heap implementation for the library intentionally locks up when it runs of memory rather than returning null. After a few more weeks of looking at the camlib I finally decided to start poking at the Bluetooth stack itself...
+</p>
+
+<h2>Broadcom's Bluetooth stack</h2>
+<p>
+The Bluetooth stack on the Wii was written by Broadcom and was actually used in quite a few devices, from car infotainment centers to old cellphones. And luckily Google decided to use it for Android in 2012, and of course in doing this they open sourced the stack. The stack is has 2 names, the older Bluedroid name and the newer Flouride name, I will be referring to it as Flouride for the rest of this article.
+</p>
+<p>
+There are several layers in Bluetooth that are used to exchange data, one of them is the l2cap layer which can be though of like a tcp packet, it as packet segmentation and reassembly, retransmission, and a port like interface called channels that can be used to talk to different services on the device as shown below.
+<center><img src="layers.png"><p>Source: Specification of the Bluetooth System (Core v2.0 + EDR)</p></center>
+When a connection to a service is established over l2cap a channel is allocated for that service, a channel number is used to keep track of what service a l2cap packet is bound for. Services refer these channels as Protocol/Service Multiplexers or PSMs. Channels 0x0000 to 0x003F are reserved for specific services but the rest are free to use.
+<center><img src="psm_values.png"><p>Source: Specification of the Bluetooth System (Core v2.0 + EDR)</p></center>
+</p>
+<p>To allow for discovering of what services are on a connective device Bluetooth requires that a service called the Service Discovery Protocol (SDP) be running on the PSM 0x0001. This service can be queried to obtain a list of services that the device offers and what PSM they have. Both devices are required to implement this as part of the Bluetooth spec. We will come back to the SDP service later as it will be useful to exploit the bug.
+</p>
+
+<h2>The bug</h2>
+<p>
+Channels are passed back and forth in l2cap packets and in Flouride each channel has a corresponding control structure called the Channel Control Block (CCB). Flouride provides a helper function called <b>l2cu_find_ccb_by_cid</b> that is used to find the CCB for a given channel id. The function below shows the function as it exists in the Flouride stack on the Wii, the <b>local_cid</b> parameter comes directly from the l2cap packet and isn't checked at all since this function <i>should</i> return null on any invalid cid that is passed in.
+<pre><code class="language-c">tL2C_CCB *l2cu_find_ccb_by_cid (tL2C_LCB *p_lcb, UINT16 local_cid)
+{
+    tL2C_CCB    *p_ccb = NULL;
+
+    if (local_cid &#x3E;= L2CAP_BASE_APPL_CID)
+    {
+        /* find the associated CCB by &#x22;index&#x22; */
+        local_cid -= L2CAP_BASE_APPL_CID;
+
+        p_ccb = l2cb.ccb_pool + local_cid; // sizeof(tL2C_CCB) == 0x7C
+
+        /* make sure the CCB is in use */
+        if (!p_ccb-&#x3E;in_use)
+        {
+            p_ccb = NULL;
+        }
+        /* make sure it&#x27;s for the same LCB */
+        else if (p_lcb &#x26;&#x26; p_lcb != p_ccb-&#x3E;p_lcb)
+        {
+            p_ccb = NULL;
+        }
+    }
+
+    return (p_ccb);
+}</code></pre>
+The bug is pretty easy to spot, the lower bounds of the <b>local_cid</b> parameter is checked to make sure it isn't a reserved cid but the upper bounds isn't check, leading to an index out of bound in the <b>ccb_pool</b> array.
+</p>
+
+<h2>Exploiting the bug</h2>
+<p>
+Somewhere after the <b>ccb_pool</b> array we need to create a fake <b>tL2C_CCB</b> struct that we can use to exploit the bug. Since the <b>ccb_pool</b> is part of the larger <b>l2cb struct</b> which is thankfully in the bss so we don't have to worry about heap allocations or alignments. So we need to find a space we control after the <b>ccb_pool</b> to create our fake <b>tL2C_CCB</b> with.
+</p>
+<p>
+After spending some time looking at what values we control I found a small buffer <b>handles</b> that is in the SDP client. This buffer is used to store handles of services from the response of a sdp service request. When two devices connect they will query the SDP server of the other device to get a list of services it offers, these services are referred to using 32 bit handles that the device will send when it wants to talk to that service.
+</p>
+<p>
+The buffer is a simple <b>uint32_t</b> array with 0x15 elements, that gives us 0x54 bytes to work with, this is pretty restrictive since the struct we are trying to fake is 0x7C bytes and because of alignment the fake struct starts at index 0xA or 0x28 bytes into the array which only gives us control of the first 0x2C bytes of the struct.
+</p>
+<p>
+So let's take a look at this struct we need to fake so we can see what we control, because of the checks in <b>l2cu_find_ccb_by_cid</b> we know we need to control the <b>in_use</b> as well as the <b>p_lcb</b> fields. Luckily these are both part of the beginning of the struct and we can set them up so that the function will return the struct.
+</p>
+<p>
+Since the <b>tL2C_CCB</b> struct is rather large and we only need to look at the first couple bytes I have truncated the struct to only the first couple fields.
+</p>
+<pre><code class="language-c">typedef struct t_l2c_ccb
+{
+    BOOLEAN             in_use;      // TRUE when in use, FALSE when not   0x00
+    tL2C_CHNL_STATE     chnl_state;  // Channel state                      0x04
+
+    void               *p_next_ccb;  // Next CCB in the chain              0x08
+    void               *p_prev_ccb;  // Previous CCB in the chain          0x0c
+    void               *p_lcb;       // Link this CCB is assigned to       0x10
+
+    UINT16              local_cid;   // Local CID                          0x14
+    UINT16              remote_cid;  // Remote CID                         0x16
+
+    TIMER_LIST_ENT      timer_entry; // CCB Timer List Entry               0x18
+
+    void               *p_rcb;       // Registration CB for this Channel   0x30
+} tL2C_CCB;</code></pre>
+<p>
+So now let's take a look at what fields we can control by overlapping it with the <b>handles</b> array at the starting location.
+</p>
+<pre><code class="language-c">handles[0x00];
+handles[0x01];
+handles[0x02];
+handles[0x03];
+handles[0x04];
+handles[0x05];
+handles[0x06];
+handles[0x07];
+handles[0x08];
+handles[0x09];
+handles[0x0a]; // in_use                     0x0
+handles[0x0b]; // chnl_state                 0x4
+handles[0x0c]; // p_next_ccb                 0x8
+handles[0x0d]; // p_prev_ccb                 0xc
+handles[0x0e]; // local_cid and remote_cid   0x10
+handles[0x0f]; // timer_entry                0x14
+handles[0x10]; // ...                        0x18
+handles[0x11]; // ...                        0x1c
+handles[0x12]; // ...                        0x20
+handles[0x13]; // ...                        0x24
+handles[0x14]; // ...                        0x28</code></pre>
+<p>
+Since we control the <b>in_use</b> and <b>p_lcb</b> fields we can get <b>l2cu_find_ccb_by_cid</b> to return this as a valid ccb, the question is what can we do with the rest of the fields to get code execution. The first thing that comes to mind is to try to get a function pointer called that is accessed from one of the pointers we control, unfortunatly the <b>p_rcb</b> where almost all the function pointers are referenced from is just out of reach at 0x30 bytes.
+</p>
+<p>
+You might also wonder what is in that <b>TIMER_LIST_ENT</b> struct and while it actually does have a function pointer in it, it is impossible to get this timer set with the fields we control without it being immediately cleared before it could every fire.
+</p>
+<p>
+That leaves us with the channel state, double link list pointers, and the lcid/rcid fields. The most interesting one is the double linked list pointers, if we could get this to be unlinked then we could get an arbitrary write to an arbitrary address assuming both values are pointers since the unlink happens in both directions.
+</p>
+<p>
+The function <b>l2cu_release_ccb</b> is what we need to have called on out fake ccb to get our unlink to happen. Here we can see the unlink doing <b>ccb->p_prev_ccb->p_next_ccb = ccb->p_next_ccb</b> and <b>ccb->p_next_ccb->p_prev_ccb = ccb->p_prev_ccb</b> to preform the unlink.
+</p>
+<center><img src="unlink.png"></center>
+<p>
+This function is called in multiple cases however each case has other functions that will be run with the struct that might cause it to reference fields we don't control and thus crash. To avoid this, we need to find the best way to get our unlink with as few functions run with our struct as possible. Luckily we control the very important field <b>chnl_state</b>, this field, as its name suggests, is used to control what state the l2cap stack thinks the channel is in. Depending on the channel state we set we can control what action the stack will take with our packet.
+</p>
+<p>
+The <b>l2cu_release_ccb</b> call will also attempt to release the <b>timer_entry</b> field so to avoid a crash this fields needs to be all zeros.
+</p>
+<p>
+After looking through all the possible actions that can be taken that lead to a unlink I found that sending a <b>L2CAP_CMD_REJECT</b> (1) packet with reason <b>L2CAP_CMD_REJ_INVALID_CID</b> (2) and having the channel be in state <b>CST_TERM_W4_SEC_COMP</b> (2) would lead to a path with only one extra function call to <b>btm_sec_abort_access_req</b> that would bail out before it did anything bad and finally call <b>l2cu_release_ccb</b> on our ccb.
+</p>
+<center><img src="good_path.png"></center>
+<p>
+Now that we have our unlink we need to use it to do something, since both values need to be pointer it makes sense that we should try to overwrite another pointer in memory, even better if we can overwrite a function pointer and have it point to a buffer we control then we can get code execution immediately. Thankfully there are several function pointers that control the switch statements for parsing l2cap packets so overwriting one of the pointers can be easily triggered to get a jump to the other pointer we control. Now all we need to do is find a good place to point the jump to. The SDP client provides yet again with a big 1000 byte buffer in the bss section that holds sdp attribute response data, this buffer is before the <b>ccb_pool</b> which is why we couldn't use it before, but now with our arbitrary jump we can just point it into this buffer we control.
+</p>
+<p>
+So by sending our payload broken up into parts of an attribute reponse to the sdp client on the Wii we can fill up this buffer with entirely controlled contents. Then by triggering our unlink and then sending a packet that uses that switch statment we will jump to the data that was copied into the sdp buffer.
+</p>
+<p>
+The Wii also has no ASLR or DEP (some games don't make high ram executable so there is <i>some</i> DEP however, all of these buffers are in low ram so it doesn't matter) so we don't even need to work around this. As part of a doubly linked list being unlinked there are also two other writes that could cause problems, mainly to the next and prev fields of the structs that we point to with our fake ccb, to work around this we just use the last switch statement in the list so that the extra write only overwrites a harmless debug string that is never printed. As for the second write that happens in our SDP buffer we can easily just jump over it since it's 0xC bytes past the pointer.
+</p>
+
+<h2>What now</h2>
+<p>
+At this point we have 1000 (minus 0x4) to fit our payload in, since I didn't want to write a usb loader in that small a size I went ahead and wrote a simple payload that would copy itself into an unused portion of memory, undo the damage from the unlink, and link itself into the switch statement from earlier. When that switch statement is taken it would instead run a function in the payload that would copy the data in the l2cap into a space in memory and return cleanly. This allows for uploading bigger payloads which is used to send a larger stage that cleans up memory and loads an embedded elf file that loads the real payload off the usb drive.
+</p>
+
+<footer>&copy; <script>document.write(new Date().getFullYear())</script><noscript>(Current Year)</noscript> Dexter Gerig</footer>
+
+</body>
+</html>
